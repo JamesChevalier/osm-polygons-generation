@@ -3,7 +3,7 @@
 
 import sys, os, cgi, subprocess, psycopg2, re
 import cgitb
-root = "/home/jocelyn/polygon-generation"
+root = "/data/project/polygons/polygons-generation"
 sys.path.append(root)
 from tools import utils
 
@@ -20,9 +20,20 @@ cgitb.enable()
 PgConn    = utils.get_dbconn()
 PgCursor  = PgConn.cursor()
 
+def get_state_timestamp(name):
+    f = open(name)
+    for line in f:
+        (key, sep, value) = line.partition("=")
+        if key.strip() == "timestamp":
+            return value.replace("\\", "")
+
+    return ""
+
+
 if rel_id == -1:
     utils.print_header("Polygon creation")
     show(u"<h1>%s</h1>" % ("Polygon creation"))
+    show(u"<p>Database was last updated on: %s</p>" % get_state_timestamp("/data/work/osmbin/replication/state.txt"))
     show(u"<p>This will generate the whole geometry of the given OSM relation id, with the corresponding sub-relations. When the geometry is available, it is possible to generate simplified geometries from this one, and export them as .poly, GeoJSON, WKT or image formats.</p>")
     show(u"<form method='GET' action=''>")
     show(u"<label for='id'>%s</label>" % "Id of relation")
@@ -56,7 +67,7 @@ if rel_id == -1:
 
     sql_list = """select polygons.id, timestamp, relations.tags
          from polygons
-         JOIN relations ON relations.id = polygons.id
+         LEFT JOIN relations ON relations.id = polygons.id
          WHERE params = '0'
          ORDER BY timestamp DESC
          LIMIT 20"""
@@ -68,11 +79,11 @@ if rel_id == -1:
         show(u"  <tr>\n")
         show(u"    <td><a href='?id=%d'>%d</a></td>\n" % (res["id"], res["id"]))
         show(u"    <td>" + str(res["timestamp"]) + "</td>\n")
-        if "name" in res["tags"]:
+        if res["tags"] is not None and "name" in res["tags"]:
             show(u"    <td>" + res["tags"]["name"] + "</td>\n")
         else:
             show(u"    <td></td>\n")
-        if "admin_level" in res["tags"]:
+        if res["tags"] is not None and "admin_level" in res["tags"]:
             show(u"    <td>" + res["tags"]["admin_level"] + "</td>\n")
         else:
             show(u"    <td></td>\n")
@@ -110,9 +121,21 @@ if rel_id == -1:
     sys.exit(0)
 
 def parse_pg_notices(notices):
+  re_lat_lon = re.compile("(.*point) ([-0-9.]*)f ([-0-9.]*)f - ways: (.*)$")
   s = u""
   for n in notices:
-    s += n.decode("utf8")
+    line = n.decode("utf8")
+    m = re_lat_lon.match(line)
+    if m:
+      lon = float(m.group(2))
+      lat = float(m.group(3))
+      ways = m.group(4).split(" ")
+      ways = ["<a target='josm' href='http://127.0.0.1:8111/load_and_zoom?left=%f&right=%f&top=%f&bottom=%f&select=way%d'>%d</a>" % (lon-0.005, lon+0.005, lat+0.005, lat-0.005, int(i), int(i)) for i in ways]
+      ways = " ".join(ways)
+      params = (m.group(1), lon-0.0005, lon+0.0005, lat+0.0005, lat-0.0005, m.group(2) + "f " + m.group(3) + "f", ways)
+      line = re_lat_lon.sub(line, "%s <a target='josm' href='http://127.0.0.1:8111/zoom?left=%f&right=%f&top=%f&bottom=%f'>%s</a> - ways: %s\n" % params)
+    s += line
+
   s = s.replace("\n", "<br>\n")
   return s
 
@@ -163,12 +186,21 @@ for res in results:
 
 if len(results) == 0 or refresh or not found_param_0:
     sys.stdout.flush()
-    sql_create = "select create_polygon(%s);"
+    PgCursor.execute("DROP TABLE IF EXISTS tmp_way_poly_%d" % rel_id)
+    PgCursor.execute("CREATE TABLE tmp_way_poly_%d (id integer, linestring geometry);" % rel_id)
+    cmd = ("../tools/OsmBin.py", "--read", "/data/work/osmbin/data/", "relation_geom", "%d" % rel_id)
+    run = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    PgCursor.copy_from(run.stdout, "tmp_way_poly_%d" % rel_id)
+    sql_create = "select create_polygon2(%s);"
     try:
         PgCursor.execute(sql_create, (rel_id, ))
     except psycopg2.InternalError:
         show(u"Error while generating polygon.")
-        show(u"You could check the geometry through <a href='http://osm8.openstreetmap.fr//~osmbin/analyse-relation-open.py?%d'>a relation analyser</a>.<br>" % rel_id)
+        show(u"You could check the geometry through an analyser:<br>")
+        show(u"<ul>")
+        show(u"<li><a href='http://download.openstreetmap.fr/cgi-bin/analyse-relation-open.py?%d'>analyser using an internal database</a>." % rel_id)
+        show(u"<li><a href='http://analyser.openstreetmap.fr/cgi-bin/index.py?relation=%d'>analyser using OSM API (slower)</a>." % rel_id)
+        show(u"</ul>")
         show(u"Message from postgresql server:<br>")
         show(u"%s" % parse_pg_notices(PgConn.notices))
         sys.exit(0)
@@ -176,6 +208,13 @@ if len(results) == 0 or refresh or not found_param_0:
     PgCursor.execute(sql_list, (rel_id, ))
         
     results = PgCursor.fetchall()
+
+    import ast
+    cmd = ("../tools/OsmBin.py", "--read", "/data/work/osmbin/data/", "relation", "%d" % rel_id)
+    run = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    j = ast.literal_eval(run.stdout.read())
+    PgCursor.execute("DELETE FROM relations WHERE id = %s", (rel_id, ))
+    PgCursor.execute("INSERT INTO relations VALUES (%s, %s)", (rel_id, j["tag"]))
 
 show(u"<h1>%s</h1>" % ("List of available polygons for id = %d" % rel_id))
 
